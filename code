@@ -1,0 +1,59 @@
+SELECT user_type, payment_method, sum(saved_net_gmv) estimated_saved_net_gmv, sum(lost_net_gmv) chargeback_lost_net_gmv, 
+  sum(passed_net_GMV) passed_net_gmv_no_dispute, sum(lost_net_gmv)/(sum(lost_net_gmv)+   sum(passed_net_GMV))::float chargeback_rate
+FROM
+(
+  SELECT user_type, user_id, order_number,
+    case 
+      when payment_method IN ('MasterCard', 'Visa', 'VISA') then 'CreditCard'
+      when payment_method = 'PayPal' then 'PayPal'
+    end payment_method,
+    case when LFS_mode like '%LFS%' and final_decision in ('Refund', 'Canceled', 'Chargeback') then net_gmv end saved_net_gmv,--👻
+    case when (LFS_mode = 'Pass' and final_decision = 'Chargeback') then net_gmv end lost_net_gmv,
+    case when final_decision = 'Pass' then net_gmv end passed_net_GMV
+  FROM 
+  (
+    SELECT 'Other Fraud' user_type, t.value_user_id user_id, t.value_order_number order_number, t.value_pay_amount net_gmv, t.value_fund_source_type payment_method,  
+    case 
+        when t.value_late_fraud_suspect_clear_date is not null then 'Pass'
+        else t.value_decision
+      end LFS_mode,
+    t.value_final_decision final_decision 
+    FROM cb_transactions t
+    JOIN table_risk_model_tagging_reason r ON r.user_id = t.value_user_id
+    WHERE tagging_reason IN ('blocked_kyc_not_accepted','blocked_kyc_refusal','blocked_suspicious','blocked_unauthorized_use','lfs_mode')
+     and clear_reason is null
+     and is_excluded is null 
+     and t.value_market = 'gb'
+     and t.value_date between '2018-01-01' and '2018-12-31'
+
+    UNION
+
+    SELECT 'Chargeback Users' user_type, t.value_user_id user_id, t.value_order_number order_number, t.value_pay_amount net_gmv, t.value_fund_source_type payment_method,  
+      case 
+        when t.value_late_fraud_suspect_clear_date is not null then 'Pass'
+        else t.value_decision
+      end LFS_mode,
+      t.value_final_decision final_decision
+
+    FROM cb_transactions t
+    JOIN table_risk_model_tagging_reason r ON r.user_id = t.value_user_id
+    LEFT JOIN view_disputes vd ON vd.invoice_number = t.value_order_number
+    JOIN (
+      SELECT t.value_user_id user_id
+      FROM cb_transactions t
+      JOIN table_risk_model_tagging_reason r ON r.user_id = t.value_user_id
+      LEFT JOIN view_disputes vd ON vd.invoice_number = t.value_order_number
+      WHERE (t.value_final_decision = 'Chargeback' OR vd.dispute_reason = 'UNAUTHORISED')
+        and tagging_reason = 'chargeback'
+        and clear_reason is null 
+        and is_excluded is null 
+        and t.value_market = 'gb'
+        and t.value_date between '2018-01-01' and '2018-12-31'
+      GROUP BY t.value_user_id
+    ) chb  ON chb.user_id = t.value_user_id
+    )
+    WHERE payment_method IN ('MasterCard', 'Visa', 'VISA','PayPal')
+    and LFS_mode != 'Fail'
+)
+GROUP BY user_type, payment_method
+ORDER BY user_type, payment_method asc
